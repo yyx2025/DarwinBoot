@@ -9,20 +9,13 @@ ASM_FUNC(DarwinCurrentEl)
 // PA (0 for none), x5=its size in bytes. EL1 only.
 ASM_FUNC(DarwinEnter)
   msr daifset, #15
-  // Paint the top 1/16 of the framebuffer green (BGRA 0xFF00FF00)
-  // before cache maintenance, MMU shutdown and the branch to the kernel.
-  cbz x4, 2f
-  lsr x9, x5, #4
-  bic x9, x9, #7
-  mov w10, #0xFF00
-  movk w10, #0xFF00, lsl #16
-  mov x11, x4
-3:
-  stp w10, w10, [x11], #8
-  subs x9, x9, #8
-  b.hi 3b
-  dsb sy
-2:
+  // Stash the framebuffer base/size in callee-clobberable temporaries. They are
+  // needed *after* the MMU is disabled, when the physical address becomes the
+  // one to write. Writing it while the MMU is still on aborts on boards that do
+  // not map the framebuffer 1:1 (synchronous external data abort from the UEFI
+  // exception handler).
+  mov x8, x4
+  mov x9, x5
   add x5, x2, x3
   mrs x6, ctr_el0
   ubfx x6, x6, #16, #4
@@ -49,4 +42,18 @@ ASM_FUNC(DarwinEnter)
   tlbi vmalle1
   dsb sy
   isb
+  // MMU is now off and the world is 1:1-mapped: the physical framebuffer base
+  // (x8) is the correct address to paint. Draw the breadcrumb here.
+  cbz x8, 2f
+  lsr x9, x9, #4
+  bic x9, x9, #7
+  mov w10, #0xFF00
+  movk w10, #0xFF00, lsl #16
+  mov x11, x8
+3:
+  stp w10, w10, [x11], #8
+  subs x9, x9, #8
+  b.hi 3b
+  dsb sy
+2:
   br x1
