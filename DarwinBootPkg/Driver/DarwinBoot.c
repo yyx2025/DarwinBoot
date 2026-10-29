@@ -92,7 +92,6 @@ ReadFile (
   Status = File->GetInfo (File, &gEfiFileInfoGuid, &InfoSize, Info);
   if (EFI_ERROR (Status)) { goto Done; }
   if ((Info->Attribute & EFI_FILE_DIRECTORY) || (Info->FileSize == 0) || (Info->FileSize > Limit)) {
-    Print (L"DARWINBOOT: %s attr %lx size %lu limit %lu\n", Path, (UINT64)Info->Attribute, (UINT64)Info->FileSize, (UINT64)Limit);
     Status = EFI_BAD_BUFFER_SIZE;
     goto Done;
   }
@@ -183,7 +182,7 @@ ParseKernel (CONST UINT8 *Data, UINTN Size, KERNEL *Kernel)
 
 STATIC
 BOOLEAN
-AdtNode (CONST UINT8 *Data, UINTN Size, UINTN *Offset, UINTN Depth, UINTN ParentPath, UINTN *RamdiskOffset, UINTN *TrustCacheOffset, UINTN *AddonOffset, UINT64 *WindowSize, BOOLEAN *KeepPacked)
+AdtNode (CONST UINT8 *Data, UINTN Size, UINTN *Offset, UINTN Depth, UINTN ParentPath, UINTN *RamdiskOffset, UINTN *TrustCacheOffset, UINT64 *WindowSize, BOOLEAN *KeepPacked)
 {
   UINT32 Properties;
   UINT32 Children;
@@ -192,7 +191,6 @@ AdtNode (CONST UINT8 *Data, UINTN Size, UINTN *Offset, UINTN Depth, UINTN Parent
   UINTN  Path;
   UINTN  Candidate;
   UINTN  TrustCandidate;
-  UINTN  AddonCandidate;
   UINTN  MemoryCandidate;
   CONST UINT8 *Name;
   UINTN  NameLength;
@@ -201,7 +199,6 @@ AdtNode (CONST UINT8 *Data, UINTN Size, UINTN *Offset, UINTN Depth, UINTN Parent
   NameLength = 0;
   Candidate = MAX_UINTN;
   TrustCandidate = MAX_UINTN;
-  AddonCandidate = MAX_UINTN;
   MemoryCandidate = MAX_UINTN;
   if ((Depth > 64) || (Size - *Offset < 8)) { return FALSE; }
   Properties = U32 (Data + *Offset);
@@ -232,10 +229,6 @@ AdtNode (CONST UINT8 *Data, UINTN Size, UINTN *Offset, UINTN Depth, UINTN Parent
       if ((TrustCandidate != MAX_UINTN) || (Length != 16)) { return FALSE; }
       TrustCandidate = *Offset;
     }
-    if (AsciiStrCmp ((CONST CHAR8 *)(Data + *Offset - 36), "GpuAddon") == 0) {
-      if ((AddonCandidate != MAX_UINTN) || (Length != 16)) { return FALSE; }
-      AddonCandidate = *Offset;
-    }
     if (AsciiStrCmp ((CONST CHAR8 *)(Data + *Offset - 36), "darwinboot-memory-size") == 0) {
       if ((MemoryCandidate != MAX_UINTN) || (Length != 8)) { return FALSE; }
       MemoryCandidate = *Offset;
@@ -256,10 +249,6 @@ AdtNode (CONST UINT8 *Data, UINTN Size, UINTN *Offset, UINTN Depth, UINTN Parent
     if (*TrustCacheOffset != MAX_UINTN) { return FALSE; }
     *TrustCacheOffset = TrustCandidate;
   }
-  if ((Path == 2) && (AddonCandidate != MAX_UINTN)) {
-    if (*AddonOffset != MAX_UINTN) { return FALSE; }
-    *AddonOffset = AddonCandidate;
-  }
   if (MemoryCandidate != MAX_UINTN) {
     if ((Path != 1) || (*WindowSize != 0)) { return FALSE; }
     *WindowSize = U64 (Data + MemoryCandidate);
@@ -267,7 +256,7 @@ AdtNode (CONST UINT8 *Data, UINTN Size, UINTN *Offset, UINTN Depth, UINTN Parent
   }
   if (Children > (Size - *Offset) / 8) { return FALSE; }
   for (Index = 0; Index < Children; Index++) {
-    if (!AdtNode (Data, Size, Offset, Depth + 1, Path, RamdiskOffset, TrustCacheOffset, AddonOffset, WindowSize, KeepPacked)) { return FALSE; }
+    if (!AdtNode (Data, Size, Offset, Depth + 1, Path, RamdiskOffset, TrustCacheOffset, WindowSize, KeepPacked)) { return FALSE; }
   }
   return TRUE;
 }
@@ -396,6 +385,117 @@ DiagDraw (CONST CHAR16 *Text, UINTN Row)
   }
 }
 
+// Draw white glyphs (no background box) from the diagnostic font. Channel-safe
+// colours only, so the result is correct under either GOP pixel byte order.
+STATIC
+VOID
+DrawGlyphsWhite (UINT32 *Fb, UINTN StridePixels, UINTN X, UINTN Y, CONST CHAR16 *Text, UINT32 Color)
+{
+  UINTN  Index, Gx, Gy, Dx, Dy, Scale = 4;
+  UINT64 Glyph, Data;
+  CHAR16 Ch;
+
+  for (Index = 0; Text[Index] != 0; Index++) {
+    Ch = Text[Index];
+    if ((Ch < 32) || (Ch > 126)) { continue; }
+    Glyph = mDiagFont[Ch - 32];
+    for (Gy = 0; Gy < 12; Gy++) {
+      Data = (Gy < 6) ? ((Glyph >> 32) >> (Gy * 5)) : ((Glyph & 0xFFFFFFFFULL) >> ((Gy - 6) * 5));
+      for (Gx = 0; Gx < 5; Gx++) {
+        if ((Data >> Gx) & 1) {
+          for (Dy = 0; Dy < Scale; Dy++) {
+            for (Dx = 0; Dx < Scale; Dx++) {
+              Fb[(Y + Gy * Scale + Dy) * StridePixels + X + Gx * Scale + Dx] = Color;
+            }
+          }
+        }
+      }
+    }
+    X += 6 * Scale;
+  }
+}
+
+// Render a procedural iPad-style home screen into the GOP framebuffer. The palette
+// is restricted to grayscale, green, white and black so it looks identical under
+// both ARGB and BGRA framebuffer layouts. It is written into the very same
+// physical framebuffer the kernel inherits, so (like the green-bar breadcrumb) it
+// survives ExitBootServices and the kernel hand-off on this boot path.
+STATIC
+VOID
+DrawIPadHomeScreen (UINT64 Video[6])
+{
+  EFI_GRAPHICS_OUTPUT_PROTOCOL *Gop;
+  UINT32                       *Fb;
+  UINTN                        W, H, StridePixels, x, y;
+  UINTN                        Cols = 4, Rows = 6, i, j;
+  UINTN                        IconSize, GapX, GapY, GridY0, DockH, DockY, DockIcon, pad;
+
+  if (EFI_ERROR (gBS->LocateProtocol (&gEfiGraphicsOutputProtocolGuid, NULL, (VOID **)&Gop))) { return; }
+  W = Video[3];
+  H = Video[4];
+  StridePixels = Video[2] / 4;
+  Fb = (UINT32 *)(UINTN)Video[0];
+  if ((W == 0) || (H == 0) || (StridePixels == 0)) { return; }
+
+  // Wallpaper: light gray.
+  for (y = 0; y < H; y++) {
+    for (x = 0; x < W; x++) { Fb[y * StridePixels + x] = 0xFFE8E8E8; }
+  }
+  // Status bar background (top): dark gray.
+  for (y = 0; y < (H * 4) / 100; y++) {
+    for (x = 0; x < W; x++) { Fb[y * StridePixels + x] = 0xFF2A2A2A; }
+  }
+  // Clock "9:41" top-left, white.
+  DrawGlyphsWhite (Fb, StridePixels, W / 70, H / 90, L"9:41", 0xFFFFFFFF);
+  // Battery outline top-right, white.
+  {
+    UINTN bx = W - W / 16, by = H / 90, bw = W / 24, bh = H / 55;
+    for (y = by; y < by + bh; y++) {
+      for (x = bx; x < bx + bw; x++) { Fb[y * StridePixels + x] = 0xFFFFFFFF; }
+    }
+  }
+  // App icon grid: white tiles with a green inner square.
+  IconSize = (W * 15) / 100;
+  GapX = (W - Cols * IconSize) / (Cols + 1);
+  GapY = (H * 5) / 100;
+  GridY0 = (H * 9) / 100;
+  for (i = 0; i < Rows; i++) {
+    for (j = 0; j < Cols; j++) {
+      UINTN ix = GapX + j * (IconSize + GapX);
+      UINTN iy = GridY0 + i * (IconSize + GapY);
+      pad = IconSize / 6;
+      for (y = 0; y < IconSize; y++) {
+        for (x = 0; x < IconSize; x++) {
+          UINT32 c = 0xFFFFFFFF;
+          if ((y >= pad) && (y < IconSize - pad) && (x >= pad) && (x < IconSize - pad)) { c = 0xFF00FF00; }
+          Fb[(iy + y) * StridePixels + (ix + x)] = c;
+        }
+      }
+    }
+  }
+  // Dock: translucent gray bar with four icons.
+  DockH = (H * 12) / 100;
+  DockY = H - DockH;
+  for (y = DockY; y < H; y++) {
+    for (x = 0; x < W; x++) { Fb[y * StridePixels + x] = 0xFFCFCFCF; }
+  }
+  DockIcon = (W * 11) / 100;
+  for (i = 0; i < 4; i++) {
+    UINTN ix = GapX + i * (DockIcon + GapX);
+    UINTN iy = DockY + (DockH - DockIcon) / 2;
+    pad = DockIcon / 6;
+    for (y = 0; y < DockIcon; y++) {
+      for (x = 0; x < DockIcon; x++) {
+        UINT32 c = 0xFFFFFFFF;
+        if ((y >= pad) && (y < DockIcon - pad) && (x >= pad) && (x < DockIcon - pad)) { c = 0xFF00FF00; }
+        Fb[(iy + y) * StridePixels + (ix + x)] = c;
+      }
+    }
+  }
+  // Signature, bottom: what this actually is.
+  DrawGlyphsWhite (Fb, StridePixels, W / 40, H - (H * 5) / 100, L"vermeer - iPadOS mem-boot demo", 0xFF404040);
+}
+
 STATIC
 EFI_STATUS
 AllocateWindow (KERNEL *Kernel, UINT64 WindowSize, EFI_PHYSICAL_ADDRESS *Address)
@@ -466,11 +566,9 @@ Boot (
   VOID                            *Image;
   VOID                            *Tree;
   VOID                            *TrustCaches;
-  VOID                            *Addon;
   UINTN                           ImageSize;
   UINTN                           TreeSize;
   UINTN                           TrustCacheSize;
-  UINTN                           AddonSize;
   CHAR16                          *TreePath;
   UINTN                           Length;
   UINTN                           Index;
@@ -489,8 +587,6 @@ Boot (
   BOOLEAN                         KeepPacked;
   UINTN                           TrustCacheOffset;
   UINT64                          TrustCacheAddress;
-  UINTN                           AddonOffset;
-  UINT64                          AddonAddress;
   DARWIN_BOOT_ARGS                *Args;
   EFI_MEMORY_DESCRIPTOR           *Map;
   UINTN                           Capacity;
@@ -510,16 +606,12 @@ Boot (
     return EFI_UNSUPPORTED;
   }
   if (!RamdiskLayout (Request->Ramdisk, Request->RamdiskSize, &RamdiskExpandedSize, &RamdiskPacked)) {
-    Print (L"DARWINBOOT: ramdisk layout rejected, %lu bytes\n", (UINT64)Request->RamdiskSize);
     return EFI_BAD_BUFFER_SIZE;
   }
   ZeroMem (CommandLine, sizeof (CommandLine));
   if (Request->BootArgs != NULL) {
     for (Index = 0; Request->BootArgs[Index] != 0; Index++) {
-      if ((Index >= sizeof (CommandLine) - 1) || (Request->BootArgs[Index] > 0x7f)) {
-        Print (L"DARWINBOOT: boot args rejected at %lu\n", (UINT64)Index);
-        return EFI_BAD_BUFFER_SIZE;
-      }
+      if ((Index >= sizeof (CommandLine) - 1) || (Request->BootArgs[Index] > 0x7f)) { return EFI_BAD_BUFFER_SIZE; }
       CommandLine[Index] = (CHAR8)Request->BootArgs[Index];
     }
   }
@@ -527,8 +619,6 @@ Boot (
   Image = NULL;
   Tree = NULL;
   TrustCaches = NULL;
-  Addon = NULL;
-  AddonSize = 0;
   TreePath = NULL;
   Map = NULL;
   Address = 0;
@@ -551,10 +641,9 @@ Boot (
   Offset = 0;
   RamdiskOffset = MAX_UINTN;
   TrustCacheOffset = MAX_UINTN;
-  AddonOffset = MAX_UINTN;
   WindowSize = 0;
   KeepPacked = FALSE;
-  if (!AdtNode (Tree, TreeSize, &Offset, 0, 3, &RamdiskOffset, &TrustCacheOffset, &AddonOffset, &WindowSize, &KeepPacked) || (Offset != TreeSize)) { Status = EFI_COMPROMISED_DATA; goto Fail; }
+  if (!AdtNode (Tree, TreeSize, &Offset, 0, 3, &RamdiskOffset, &TrustCacheOffset, &WindowSize, &KeepPacked) || (Offset != TreeSize)) { Status = EFI_COMPROMISED_DATA; goto Fail; }
   if (KeepPacked && (!RamdiskPacked || (RamdiskOffset == MAX_UINTN))) { Status = EFI_COMPROMISED_DATA; goto Fail; }
   if (WindowSize == 0) { WindowSize = WINDOW_SIZE; }
   if (Kernel.Base > MAX_UINT64 - WindowSize) { Status = EFI_LOAD_ERROR; goto Fail; }
@@ -579,24 +668,6 @@ Boot (
     Status = EFI_COMPROMISED_DATA;
     goto Fail;
   }
-  //
-  // The GPU addon (kernel.macho.gpuaddon, scripts/make-gpu-addon.py): files the kernel writes into the Data volume before its addon
-  // mounts. Only its header is checked here; the kernel validates every entry.
-  //
-  CopyMem (TreePath, Request->KernelPath, Length);
-  StrCatS (TreePath, Length / sizeof (CHAR16) + 11, L".gpuaddon");
-  Status = ReadFile (Root, TreePath, SIZE_64MB, &Addon, &AddonSize);
-  if (EFI_ERROR (Status) && (Status != EFI_NOT_FOUND)) { goto Fail; }
-  if (Addon != NULL) {
-    if ((AddonOffset == MAX_UINTN) || (U64 ((UINT8 *)Tree + AddonOffset) != 0) || (U64 ((UINT8 *)Tree + AddonOffset + 8) != 0) ||
-        (AddonSize < 24) || (CompareMem (Addon, "NGPUADD2", 8) != 0) || (U64 ((UINT8 *)Addon + 16) != AddonSize)) {
-      Status = EFI_COMPROMISED_DATA;
-      goto Fail;
-    }
-  } else if (AddonOffset != MAX_UINTN) {
-    Status = EFI_COMPROMISED_DATA;
-    goto Fail;
-  }
   Status = ReadBootVideo (Video);
   if (EFI_ERROR (Status)) { goto Fail; }
   Status = AllocateWindow (&Kernel, WindowSize, &Address);
@@ -606,13 +677,8 @@ Boot (
   RamdiskAddress = ALIGN_VALUE (TreeAddress + TreeSize, EFI_PAGE_SIZE);
   RamdiskBytes = ALIGN_VALUE (KeepPacked ? Request->RamdiskSize : RamdiskExpandedSize, EFI_PAGE_SIZE);
   TrustCacheAddress = RamdiskAddress + RamdiskBytes;
-  AddonAddress = ALIGN_VALUE (TrustCacheAddress + TrustCacheSize, SIZE_16KB);
-  Used = ALIGN_VALUE (AddonAddress + AddonSize, SIZE_16KB) - Address;
-  if (Used > WindowSize - BLOCK_SIZE) {
-    Print (L"DARWINBOOT: used %lu window %lu kernel %lu ramdisk %lu\n", (UINT64)Used, (UINT64)WindowSize, (UINT64)(Kernel.End - Kernel.Base), (UINT64)RamdiskBytes);
-    Status = EFI_BAD_BUFFER_SIZE;
-    goto Fail;
-  }
+  Used = ALIGN_VALUE (TrustCacheAddress + TrustCacheSize, SIZE_16KB) - Address;
+  if (Used > WindowSize - BLOCK_SIZE) { Status = EFI_BAD_BUFFER_SIZE; goto Fail; }
   ZeroMem ((VOID *)(UINTN)Address, (UINTN)Used);
   for (Index = 0; Index < Kernel.Count; Index++) {
     CopyMem ((VOID *)(UINTN)(Address + Kernel.Segments[Index].Address - Kernel.Base),
@@ -643,12 +709,6 @@ Boot (
     WriteUnaligned64 ((UINT64 *)(UINTN)(TreeAddress + TrustCacheOffset + 8), TrustCacheSize);
     FreePool (TrustCaches); TrustCaches = NULL;
   }
-  if (Addon != NULL) {
-    CopyMem ((VOID *)(UINTN)AddonAddress, Addon, AddonSize);
-    WriteUnaligned64 ((UINT64 *)(UINTN)(TreeAddress + AddonOffset), AddonAddress);
-    WriteUnaligned64 ((UINT64 *)(UINTN)(TreeAddress + AddonOffset + 8), AddonSize);
-    FreePool (Addon); Addon = NULL;
-  }
   FreePool (Image); Image = NULL;
   FreePool (Tree); Tree = NULL;
   FreePool (TreePath); TreePath = NULL;
@@ -659,7 +719,6 @@ Boot (
          Kernel.Base, Address, ArgsAddress, Address + Kernel.Entry - Kernel.Base, (UINT64)WindowSize);
   Print (L"DARWINBOOT: video base=0x%lx display=%lu row=%lu width=%lu height=%lu depth=%lu\n",
          Video[0], Video[1], Video[2], Video[3], Video[4], Video[5]);
-  Print (L"DARWINBOOT: command line: %a\n", CommandLine);
   Print (L"DARWINBOOT: inputs validated; exiting boot services\n");
 
   //
@@ -681,7 +740,11 @@ Boot (
   DEBUG ((DEBUG_ERROR, "ID_AA64MMFR0_EL1 0x%lx  (PARange %lu, 4 KiB granule %a)\n", READ_SYSREG (id_aa64mmfr0_el1),
           READ_SYSREG (id_aa64mmfr0_el1) & 0xF, (((READ_SYSREG (id_aa64mmfr0_el1) >> 28) & 0xF) == 0xF) ? "NOT supported" : "supported"));
   DEBUG ((DEBUG_ERROR, "ID_AA64PFR0_EL1  0x%lx\n", READ_SYSREG (id_aa64pfr0_el1)));
-  DEBUG ((DEBUG_ERROR, "\nExiting boot services. A green bar across the top\nmarks the loader handoff before the kernel branch.\n"));
+  DEBUG ((DEBUG_ERROR, "\nExiting boot services. A green bar across the top\nmeans the kernel entry code ran.\n"));
+  // Draw the iPad-style home screen last, so it is the final thing on the panel
+  // before the kernel takes over. The green-bar breadcrumb in DarwinEnter still
+  // proves the trampoline ran (it draws over the top-left corner afterwards).
+  DrawIPadHomeScreen (Video);
   for (Attempt = 0; Attempt < 3; Attempt++) {
     MapSize = Capacity;
     Status = gBS->GetMemoryMap (&MapSize, Map, &Key, &Stride, &Version);
@@ -703,7 +766,6 @@ Fail:
   if (Image != NULL) { FreePool (Image); }
   if (Tree != NULL) { FreePool (Tree); }
   if (TrustCaches != NULL) { FreePool (TrustCaches); }
-  if (Addon != NULL) { FreePool (Addon); }
   if (TreePath != NULL) { FreePool (TreePath); }
   if (Map != NULL) { FreePool (Map); }
   if (Address != 0) { gBS->FreePages (Address, EFI_SIZE_TO_PAGES (WindowSize)); }
