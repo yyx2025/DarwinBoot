@@ -9,13 +9,11 @@ ASM_FUNC(DarwinCurrentEl)
 // PA (0 for none), x5=its size in bytes. EL1 only.
 ASM_FUNC(DarwinEnter)
   msr daifset, #15
-  // Stash the framebuffer base/size in callee-clobberable temporaries. They are
-  // needed *after* the MMU is disabled, when the physical address becomes the
-  // one to write. Writing it while the MMU is still on aborts on boards that do
-  // not map the framebuffer 1:1 (synchronous external data abort from the UEFI
-  // exception handler).
-  mov x8, x4
-  mov x9, x5
+  // Preserve the framebuffer PA/size; x4/x5 are reused by the cache clean below.
+  mov x8, x4            // framebuffer PA (0 = none)
+  mov x9, x5            // framebuffer size in bytes
+  // Clean the owned kernel window to the point of coherency while the MMU is
+  // still on, so the physical RAM holds the freshly copied kernel image.
   add x5, x2, x3
   mrs x6, ctr_el0
   ubfx x6, x6, #16, #4
@@ -33,6 +31,7 @@ ASM_FUNC(DarwinEnter)
   ic iallu
   dsb sy
   isb
+  // Turn the MMU off. From this point every address is physical.
   mrs x4, sctlr_el1
   bic x4, x4, #1
   bic x4, x4, #4
@@ -42,11 +41,14 @@ ASM_FUNC(DarwinEnter)
   tlbi vmalle1
   dsb sy
   isb
-  // MMU is now off and the world is 1:1-mapped: the physical framebuffer base
-  // (x8) is the correct address to paint. Draw the breadcrumb here.
+  // Breadcrumb: a small green block at the top-left corner proves this code ran
+  // and the MMU is off. Kept small so it does not cover the iPad home screen the
+  // loader draws. It MUST be drawn now, not before the MMU was disabled:
+  // Video[0] is the framebuffer PHYSICAL base (what the kernel wants in
+  // boot_args), and writing it with the UEFI MMU on aborts on boards where
+  // FrameBufferBase has no 1:1 virtual mapping (synchronous external abort).
   cbz x8, 2f
-  lsr x9, x9, #4
-  bic x9, x9, #7
+  mov x9, #8192
   mov w10, #0xFF00
   movk w10, #0xFF00, lsl #16
   mov x11, x8
